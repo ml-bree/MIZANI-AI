@@ -157,3 +157,31 @@ def health():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
+
+# -- Run in Supabase SQL Editor
+CREATE TABLE candidates (
+    candidate_id SERIAL PRIMARY KEY,
+    candidate_name VARCHAR(255) NOT NULL,
+    constituency VARCHAR(255) NOT NULL,
+    political_party VARCHAR(255),
+    declared_assets NUMERIC(12,2) DEFAULT 0
+);
+
+CREATE TABLE expenditures (
+    expenditure_id SERIAL PRIMARY KEY,
+    candidate_id INTEGER REFERENCES candidates(candidate_id),
+    source_type VARCHAR(100),
+    amount NUMERIC(12,2),
+    confidence_score NUMERIC(3,2),
+    description_of_the_expenditure_spended TEXT,
+    location VARCHAR(255),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Enable RLS (optional for demo)
+ALTER TABLE candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expenditures ENABLE ROW LEVEL SECURITY;
+
+-- Sample data
+INSERT INTO candidates (candidate_name, constituency, political_party, declared_assets) 
+VALUES ('Candidate X', 'Starehe', 'Demo Party', 4500000);
