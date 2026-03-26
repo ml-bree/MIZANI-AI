@@ -1,7 +1,8 @@
-flask>=3.0
-supabase>=2.0
-python-dotenv>=1.0
-africastalking>=1.2
-requests>=2.31
-pandas>=2.0
-reportlab>=4.0
+flask>=3.0.0
+supabase>=2.4.0
+python-dotenv>=1.0.0
+africastalking>=1.2.8
+requests>=2.31.0
+pandas>=2.2.0
+reportlab>=4.1.0
+gunicorn>=21.2.0
