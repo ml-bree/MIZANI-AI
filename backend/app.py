@@ -852,7 +852,7 @@ def health():
         "db_status":         db_status,
         "demo_mode":         DEMO_MODE,
         "alert_recipients":  len(ALERT_RECIPIENTS),
-        "at_username":       os.environ.get("AT_USERNAME"),
+        "at_username":       os.environ.get("AFRICAS_TALKING_USERNAME"),
         "pdf_bucket":        PDF_BUCKET,
     })
 
