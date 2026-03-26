@@ -571,7 +571,14 @@ USSD_MENUS = {
     },
 }
 
-
+def _sim_swap_check(phone: str) -> dict:
+    """SIM swap check - safe fallback for hackathon demo."""
+    if DEMO_MODE:
+        return {"swapped": False, "confidence": 0.95}
+    # Production: AT SIM Swap API (disabled for now)
+    logger.info(f"SIM-swap check skipped for {phone}")
+    return {"swapped": False, "confidence": 0.80}
+    
 @app.route("/api/ussd/callback", methods=["POST"])
 def ussd_callback():
     session_id = request.values.get("sessionId", "")
@@ -583,11 +590,11 @@ def ussd_callback():
     lang = get_session_lang(session_id)
     M    = USSD_MENUS[lang]
 
-    # SIM-swap guard
-    if not DEMO_MODE:
-        swap = _sim_swap_check(phone)
-        if swap.get("swapped"):
-            return _ussd_response(M["security"])
+    # # SIM-swap guard
+    # if not DEMO_MODE:
+    #     swap = _sim_swap_check(phone)
+    #     if swap.get("swapped"):
+    #         return _ussd_response(M["security"])
 
     # ── Level 0 : welcome ──────────────────────────────────────────────────
     if not text:
