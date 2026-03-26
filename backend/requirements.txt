@@ -1,0 +1,7 @@
+flask>=3.0
+supabase>=2.0
+python-dotenv>=1.0
+africastalking>=1.2
+requests>=2.31
+pandas>=2.0
+reportlab>=4.0
