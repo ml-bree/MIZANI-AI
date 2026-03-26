@@ -1,10 +1,9 @@
-# app.py — Mizani AI Backend (Full Africa's Talking Integration)
-# pip install flask supabase python-dotenv africastalking requests pandas reportlab
+# app.py — Mizani AI Backend (Production-Ready)
+# pip install flask supabase python-dotenv africastalking requests pandas reportlab gunicorn
 
-import os, re, json
+import os, re, json, logging
 import pandas as pd
 from flask import Flask, request, jsonify, Response
-from supabase import create_client, Client
 from dotenv import load_dotenv
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
@@ -19,39 +18,72 @@ from reportlab.lib.enums import TA_CENTER
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "static", "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
+# ── DEMO_MODE ─────────────────────────────────────────────────────────────────
+# Set DEMO_MODE=false in Render environment variables for production.
 DEMO_MODE = os.environ.get("DEMO_MODE", "true").lower() == "true"
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
-supabase: Client = create_client(
-    os.environ.get("SUPABASE_URL"),
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
-)
+# ── Supabase (lazy init to avoid crash on missing env vars) ───────────────────
+_supabase_client = None
 
-# ── Africa's Talking (lazy init) ──────────────────────────────────────────────
-_at = {}
+def supabase():
+    """Return a cached Supabase client, initialising on first use."""
+    global _supabase_client
+    if _supabase_client is None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not key:
+            raise RuntimeError(
+                "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set "
+                "in your Render environment variables."
+            )
+        from supabase import create_client
+        _supabase_client = create_client(url, key)
+    return _supabase_client
+
+
+# ── Africa's Talking (lazy init, re-initialises if env changes) ───────────────
+_at_cache = {}
+_at_initialized = False
 
 def at(service: str):
-    """Return cached AT service handle (sms | airtime | voice | ussd)."""
-    if service not in _at:
-        import africastalking
-        africastalking.initialize(
-            username=os.environ.get("AT_USERNAME", "sandbox"),
-            api_key=os.environ.get("AT_API_KEY", ""),
-        )
-        _at["sms"]     = africastalking.SMS
-        _at["airtime"] = africastalking.Airtime
-        _at["voice"]   = africastalking.Voice
-    return _at.get(service)
+    """Return cached AT service handle (sms | airtime | voice).
+    Re-initialises whenever called with fresh env vars so sandbox→prod
+    switch works correctly without a restart.
+    """
+    global _at_initialized, _at_cache
 
-# Alert recipients from env: comma-separated phone numbers
+    username = os.environ.get("AT_USERNAME", "sandbox")
+    api_key  = os.environ.get("AT_API_KEY", "")
+
+    # Re-init if credentials have changed or not yet initialised
+    cache_key = f"{username}:{api_key}"
+    if _at_cache.get("_key") != cache_key:
+        import africastalking
+        africastalking.initialize(username=username, api_key=api_key)
+        _at_cache = {
+            "_key":    cache_key,
+            "sms":     africastalking.SMS,
+            "airtime": africastalking.Airtime,
+            "voice":   africastalking.Voice,
+        }
+        logger.info(f"Africa's Talking initialised — username: {username}")
+
+    return _at_cache[service]
+
+
+# ── Alert recipients ──────────────────────────────────────────────────────────
 ALERT_RECIPIENTS = [
     p.strip() for p in os.environ.get("ALERT_PHONES", "").split(",") if p.strip()
 ]
+
+# ── Supabase Storage bucket for PDFs ─────────────────────────────────────────
+# Create a public bucket called "reports" in your Supabase project.
+PDF_BUCKET = os.environ.get("SUPABASE_PDF_BUCKET", "reports")
 
 # ── Sighting catalogue ────────────────────────────────────────────────────────
 SIGHTINGS = {
@@ -65,7 +97,7 @@ SMS_KEYWORDS = {
     "BILLBOARD": "1", "BANGO": "1",
     "CONVOY":    "2", "GARI":  "2",
     "RALLY":     "3", "MKUTANO": "3",
-    "CASH":      "4", "PESA":   "4", "GIFTS": "4","ZAWADI": "4",
+    "CASH":      "4", "PESA":   "4", "GIFTS": "4", "ZAWADI": "4",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,24 +118,25 @@ def fetch_meta_ads(name: str) -> float:
 
 def candidate_suggestions(name: str, constituency: str) -> list:
     try:
-        r = (supabase.table("candidates")
+        r = (supabase().table("candidates")
              .select("candidate_name")
              .ilike("candidate_name", f"%{name}%")
              .limit(5).execute())
         return [x["candidate_name"] for x in r.data]
-    except Exception:
+    except Exception as e:
+        logger.error(f"candidate_suggestions error: {e}")
         return []
 
 def upsert_candidate(name: str, constituency: str) -> str:
-    """Return candidate_id, creating record if missing."""
-    r = (supabase.table("candidates")
+    """Return candidate_id (UUID string), creating record if missing."""
+    r = (supabase().table("candidates")
          .select("candidate_id")
          .ilike("candidate_name", f"%{name}%")
          .eq("constituency", constituency)
          .execute())
     if r.data:
         return r.data[0]["candidate_id"]
-    res = supabase.table("candidates").insert({
+    res = supabase().table("candidates").insert({
         "candidate_name":  name,
         "constituency":    constituency,
         "declared_assets": 0,
@@ -115,7 +148,7 @@ def upsert_candidate(name: str, constituency: str) -> str:
 def insert_expenditure(candidate_id: str, source_type: str,
                        amount: float, confidence: float,
                        description: str, location: str):
-    supabase.table("expenditures").insert({
+    supabase().table("expenditures").insert({
         "candidate_id":   candidate_id,
         "source_type":    source_type,
         "amount":         amount,
@@ -127,24 +160,33 @@ def insert_expenditure(candidate_id: str, source_type: str,
 
 def count_constituency_reports(constituency: str) -> int:
     try:
-        r = (supabase.table("expenditures")
+        r = (supabase().table("expenditures")
              .select("count", count="exact")
              .eq("location", constituency)
              .execute())
         return r.count or 0
-    except Exception:
+    except Exception as e:
+        logger.error(f"count_constituency_reports error: {e}")
         return 0
+
+def format_report_id(candidate_id: str) -> str:
+    """
+    FIX: candidate_id is a UUID string, not an int.
+    Take the first 8 hex chars and uppercase them for a readable reference.
+    e.g. "a3f2c1d0-..." → "A3F2C1D0"
+    """
+    return str(candidate_id).replace("-", "")[:8].upper()
 
 def send_sms(recipients: list, message: str):
     if not recipients:
         return {"skipped": "no recipients"}
     if DEMO_MODE:
-        print(f"[DEMO SMS → {recipients}]\n{message}\n")
+        logger.info(f"[DEMO SMS → {recipients}]\n{message}")
         return {"demo": True}
     try:
         return at("sms").send(message, recipients)
     except Exception as e:
-        print(f"SMS error: {e}")
+        logger.error(f"SMS error: {e}")
         return {"error": str(e)}
 
 def send_alert_sms(candidate: str, constituency: str,
@@ -163,7 +205,7 @@ def send_alert_sms(candidate: str, constituency: str,
 def reward_airtime(phone: str, amount_kes: float = 5.0):
     """Send small airtime reward to a citizen reporter."""
     if DEMO_MODE:
-        print(f"[DEMO AIRTIME] KES {amount_kes} → {phone}")
+        logger.info(f"[DEMO AIRTIME] KES {amount_kes} → {phone}")
         return {"demo": True}
     try:
         return at("airtime").send(
@@ -172,15 +214,26 @@ def reward_airtime(phone: str, amount_kes: float = 5.0):
             currency_code="KES"
         )
     except Exception as e:
-        print(f"Airtime error: {e}")
+        logger.error(f"Airtime error: {e}")
         return {"error": str(e)}
 
-# ── PDF generator ─────────────────────────────────────────────────────────────
+
+# ── PDF generator (uploads to Supabase Storage, not local disk) ───────────────
 
 def generate_pdf(payload: dict) -> str:
+    """
+    Build the PDF in /tmp (ephemeral but fine for generation),
+    upload to Supabase Storage, and return the public URL.
+
+    FIX: Render's filesystem is ephemeral — files written outside /tmp
+    disappear on every deploy. We now upload to Supabase Storage so
+    reports persist permanently.
+    """
+    import tempfile
+
     ts    = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname = f"mizani_{safe_fn(payload['candidate'])}_{ts}.pdf"
-    path  = os.path.join(UPLOAD_FOLDER, fname)
+    path  = os.path.join(tempfile.gettempdir(), fname)
 
     doc = SimpleDocTemplate(path, pagesize=A4,
                             rightMargin=2*cm, leftMargin=2*cm,
@@ -207,18 +260,16 @@ def generate_pdf(payload: dict) -> str:
                   sty("B", fontSize=13, alignment=TA_CENTER, spaceAfter=12)),
     ]
 
-    # Candidate summary
     story.append(Paragraph("Candidate Summary",
                             sty("H", fontSize=12, textColor=brand,
                                 spaceBefore=14, spaceAfter=6)))
     sum_data = [
-        ["Candidate",   payload["candidate"]],
-        ["Constituency",payload["constituency"]],
-        ["Generated",   datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")],
+        ["Candidate",    payload["candidate"]],
+        ["Constituency", payload["constituency"]],
+        ["Generated",    datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")],
     ]
     story.append(_table(sum_data, [5*cm, 12*cm], brand))
 
-    # Financials
     story.append(Paragraph("Financial Breakdown",
                             sty("H2", fontSize=12, textColor=brand,
                                 spaceBefore=14, spaceAfter=6)))
@@ -238,7 +289,6 @@ def generate_pdf(payload: dict) -> str:
     story.append(_table(fin_data, [6*cm, 4.5*cm, 6.5*cm], brand,
                         header=True, last_row_color=ac))
 
-    # Evidence
     if payload.get("evidence"):
         story.append(Paragraph("Evidence Sources",
                                 sty("H3", fontSize=12, textColor=brand,
@@ -254,8 +304,7 @@ def generate_pdf(payload: dict) -> str:
 
     story += [
         Spacer(1, 0.5*cm),
-        HRFlowable(width="100%", thickness=0.5,
-                   color=colors.HexColor("#CCC")),
+        HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCC")),
         Spacer(1, 0.3*cm),
         Paragraph(
             "<b>Methodology:</b> SPR = total_estimated_spend ÷ (declared_assets × 1.3). "
@@ -267,7 +316,27 @@ def generate_pdf(payload: dict) -> str:
         ),
     ]
     doc.build(story)
-    return path
+
+    # Upload to Supabase Storage
+    with open(path, "rb") as f:
+        pdf_bytes = f.read()
+
+    try:
+        supabase().storage.from_(PDF_BUCKET).upload(
+            path=fname,
+            file=pdf_bytes,
+            file_options={"content-type": "application/pdf"},
+        )
+        public_url = (
+            supabase().storage.from_(PDF_BUCKET).get_public_url(fname)
+        )
+        logger.info(f"PDF uploaded: {public_url}")
+        return public_url
+    except Exception as e:
+        logger.error(f"Supabase Storage upload failed: {e}")
+        # Fallback: return temp path (won't persist but won't crash)
+        return path
+
 
 def _table(data, col_widths, brand, header=False, last_row_color=None):
     t = Table(data, colWidths=col_widths)
@@ -293,6 +362,69 @@ def _table(data, col_widths, brand, header=False, last_row_color=None):
     t.setStyle(TableStyle(style))
     return t
 
+
+# ── USSD session language (Supabase-backed for multi-instance safety) ─────────
+
+def get_session_lang(session_id: str) -> str:
+    """
+    FIX: In-memory SESSION_LANG dict breaks when Render runs multiple
+    instances or restarts. We now persist language preference in Supabase.
+    """
+    try:
+        r = (supabase().table("ussd_sessions")
+             .select("lang")
+             .eq("session_id", session_id)
+             .execute())
+        if r.data:
+            return r.data[0].get("lang", "en")
+    except Exception as e:
+        logger.warning(f"get_session_lang error: {e}")
+    return "en"
+
+def set_session_lang(session_id: str, lang: str):
+    try:
+        supabase().table("ussd_sessions").upsert({
+            "session_id": session_id,
+            "lang":       lang,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.warning(f"set_session_lang error: {e}")
+
+
+# ── SIM-swap check ────────────────────────────────────────────────────────────
+
+def _sim_swap_check(phone: str) -> dict:
+    """
+    FIX: Previously returned a hardcoded dict in production.
+    Now calls the AT SIM Swap Detection API when DEMO_MODE=false.
+    Requires AT_SIM_SWAP_URL to be set (from AT dashboard).
+    """
+    if DEMO_MODE:
+        return {"swapped": False, "confidence": 0.95}
+    try:
+        import requests as req
+        url = os.environ.get(
+            "AT_SIM_SWAP_URL",
+            "https://api.africastalking.com/sim-swap/check"
+        )
+        headers = {
+            "apiKey":  os.environ.get("AT_API_KEY", ""),
+            "Accept":  "application/json",
+        }
+        resp = req.post(url, json={"phoneNumber": phone}, headers=headers, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "swapped":    data.get("swapped", False),
+            "confidence": data.get("confidence", 0.80),
+        }
+    except Exception as e:
+        logger.error(f"SIM swap check error: {e}")
+        # Fail open — don't block legitimate users if the API is down
+        return {"swapped": False, "confidence": 0.50}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,20 +442,20 @@ def import_iebc():
         r["candidate_name"]  = r.pop("name")
         r["political_party"] = r.pop("party")
         r["iebc_source"]     = "2022_elections"
-    supabase.table("candidates").upsert(batch).execute()
+    supabase().table("candidates").upsert(batch).execute()
     return jsonify({"status": "success", "imported": len(batch), "sample": batch[:2]})
 
 
 @app.route("/api/analyze", methods=["POST"])
 def analyze_candidate():
-    data          = request.json or {}
-    cand_name     = data.get("candidate_name","").strip().lower()
-    constituency  = data.get("constituency","").strip().lower()
+    data         = request.json or {}
+    cand_name    = data.get("candidate_name","").strip().lower()
+    constituency = data.get("constituency","").strip().lower()
     if not cand_name or not constituency:
         return jsonify({"error": "candidate_name and constituency required"}), 400
 
     # STEP 1 — IEBC lookup
-    r = (supabase.table("candidates").select("*")
+    r = (supabase().table("candidates").select("*")
          .ilike("candidate_name", f"%{cand_name}%")
          .eq("constituency", constituency.title())
          .execute())
@@ -332,23 +464,23 @@ def analyze_candidate():
             "error": "Candidate not in IEBC data",
             "suggestions": candidate_suggestions(cand_name, constituency)
         }), 404
-    cand            = r.data[0]
-    declared        = float(cand.get("declared_assets") or 0)
+    cand     = r.data[0]
+    declared = float(cand.get("declared_assets") or 0)
 
     # STEP 2 — DB expenditures
-    exps = (supabase.table("expenditures")
+    exps = (supabase().table("expenditures")
             .select("amount,source_type,confidence_score")
             .eq("candidate_id", cand["candidate_id"])
             .execute())
     db_spend = sum(float(e.get("amount") or 0) for e in exps.data)
 
     # STEP 3 — External channels
-    meta       = fetch_meta_ads(cand["candidate_name"])
-    total      = db_spend + meta
-    ceiling    = declared * 1.3
-    spr        = total / ceiling if ceiling > 0 else float("inf")
-    anomaly    = round(spr - 1.0, 4)
-    lvl        = alert_level(spr)
+    meta    = fetch_meta_ads(cand["candidate_name"])
+    total   = db_spend + meta
+    ceiling = declared * 1.3
+    spr     = total / ceiling if ceiling > 0 else float("inf")
+    anomaly = round(spr - 1.0, 4)
+    lvl     = alert_level(spr)
 
     evidence = (
         [{"type": "meta_ads", "amount": meta, "confidence": 0.89},
@@ -372,18 +504,18 @@ def analyze_candidate():
         "evidence":              evidence,
     }
 
-    # STEP 4 — PDF
+    # STEP 4 — PDF (uploaded to Supabase Storage)
     try:
-        pdf_path       = generate_pdf(payload)
-        payload["report_pdf"] = "/static/uploads/" + os.path.basename(pdf_path)
+        pdf_url = generate_pdf(payload)
+        payload["report_pdf"] = pdf_url
     except Exception as e:
-        print(f"PDF error: {e}")
+        logger.error(f"PDF error: {e}")
         payload["report_pdf"] = None
 
     # STEP 5 — SMS alert
     if lvl in ("YELLOW","CRITICAL"):
         ev_summary = f"Meta KES {meta:,.0f}, DB KES {db_spend:,.0f}"
-        url = f"https://mizani.ke{payload.get('report_pdf','')}"
+        url = payload.get("report_pdf") or f"https://mizani.ke/r/{safe_fn(cand['candidate_name'])}"
         payload["sms_alert"] = send_alert_sms(
             cand["candidate_name"], cand["constituency"],
             spr, lvl, url, ev_summary
@@ -403,8 +535,8 @@ USSD_MENUS = {
             "2. Check a candidate\n"
             "0. Switch to Kiswahili"
         ),
-        "ask_const": "CON Enter constituency name:",
-        "ask_cand":  "CON Enter candidate full name:",
+        "ask_const":     "CON Enter constituency name:",
+        "ask_cand":      "CON Enter candidate full name:",
         "ask_sight": (
             "CON What did you observe?\n"
             "1. Billboard / signage\n"
@@ -413,7 +545,7 @@ USSD_MENUS = {
             "4. Cash or gifts distributed"
         ),
         "ask_cand_check": "CON Enter candidate name to check SPR:",
-        "invalid": "END ❌ Invalid input. Please dial *384# again.",
+        "invalid":  "END ❌ Invalid input. Please dial *384# again.",
         "security": "END ⚠️ Security check failed. Session ended.",
     },
     "sw": {
@@ -424,8 +556,8 @@ USSD_MENUS = {
             "2. Angalia mgombea\n"
             "0. Switch to English"
         ),
-        "ask_const": "CON Ingiza jina la jimbo:",
-        "ask_cand":  "CON Ingiza jina kamili la mgombea:",
+        "ask_const":     "CON Ingiza jina la jimbo:",
+        "ask_cand":      "CON Ingiza jina kamili la mgombea:",
         "ask_sight": (
             "CON Uliona nini?\n"
             "1. Bango au tangazo\n"
@@ -434,13 +566,10 @@ USSD_MENUS = {
             "4. Pesa au zawadi zilizosambazwa"
         ),
         "ask_cand_check": "CON Ingiza jina la mgombea kukagua SPR:",
-        "invalid": "END ❌ Ingizo batili. Piga simu *384# tena.",
+        "invalid":  "END ❌ Ingizo batili. Piga simu *384# tena.",
         "security": "END ⚠️ Ukaguzi wa usalama umeshindwa. Kikao kimeisha.",
     },
 }
-
-# In-memory language preference per session (production: use Redis/DB)
-SESSION_LANG = {}
 
 
 @app.route("/api/ussd/callback", methods=["POST"])
@@ -450,8 +579,8 @@ def ussd_callback():
     text       = request.values.get("text", "").strip()
     steps      = [s.strip() for s in text.split("*")] if text else []
 
-    # Language resolution
-    lang = SESSION_LANG.get(session_id, "en")
+    # Language resolution (Supabase-backed — safe across multiple instances)
+    lang = get_session_lang(session_id)
     M    = USSD_MENUS[lang]
 
     # SIM-swap guard
@@ -462,13 +591,13 @@ def ussd_callback():
 
     # ── Level 0 : welcome ──────────────────────────────────────────────────
     if not text:
-        SESSION_LANG[session_id] = "en"
+        set_session_lang(session_id, "en")
         return _ussd_response(USSD_MENUS["en"]["welcome"])
 
     # ── Language toggle ────────────────────────────────────────────────────
     if len(steps) == 1 and steps[0] == "0":
         new_lang = "sw" if lang == "en" else "en"
-        SESSION_LANG[session_id] = new_lang
+        set_session_lang(session_id, new_lang)
         return _ussd_response(USSD_MENUS[new_lang]["welcome"])
 
     # ── Branch: Report (1) vs Check (2) ───────────────────────────────────
@@ -497,12 +626,10 @@ def ussd_callback():
                 cid, src, amt, conf,
                 f"USSD sighting by {phone}: {src}", constituency
             )
-            count = count_constituency_reports(constituency)
-            # Reward citizen with KES 5 airtime
+            count     = count_constituency_reports(constituency)
+            report_id = format_report_id(cid)  # FIX: UUID-safe
             reward_airtime(phone, 5.0)
 
-            report_id = f"{cid:06d}"  # "000123"
-    
             if lang == "sw":
                 msg = (
                     f"END ✅ Asante! Ripoti #{report_id} imehifadhiwa.\n"
@@ -525,7 +652,7 @@ def ussd_callback():
     if steps[0] == "2":
         if len(steps) == 2:
             name = steps[1].lower()
-            r = (supabase.table("candidates").select("*")
+            r = (supabase().table("candidates").select("*")
                  .ilike("candidate_name", f"%{name}%")
                  .limit(1).execute())
             if not r.data:
@@ -536,15 +663,15 @@ def ussd_callback():
                 )
             c   = r.data[0]
             dec = float(c.get("declared_assets") or 0)
-            exr = (supabase.table("expenditures")
+            exr = (supabase().table("expenditures")
                    .select("amount")
                    .eq("candidate_id", c["candidate_id"])
                    .execute())
-            db_sp  = sum(float(e.get("amount") or 0) for e in exr.data)
-            total  = db_sp + fetch_meta_ads(c["candidate_name"])
-            ceil   = dec * 1.3
-            spr    = round(total / ceil, 2) if ceil > 0 else 0
-            lvl    = alert_level(spr)
+            db_sp = sum(float(e.get("amount") or 0) for e in exr.data)
+            total = db_sp + fetch_meta_ads(c["candidate_name"])
+            ceil  = dec * 1.3
+            spr   = round(total / ceil, 2) if ceil > 0 else 0
+            lvl   = alert_level(spr)
 
             if lang == "sw":
                 msg = (
@@ -581,11 +708,9 @@ def sms_inbound():
     phone   = request.values.get("from", "").strip()
     message = request.values.get("text", "").strip().upper()
 
-    # Handle journalist reply: MOREINFO <candidate>
     if message.startswith("MOREINFO"):
         return _handle_journalist_reply(phone, message)
 
-    # Detect sighting keyword
     sighting_key = None
     clean        = message
     for kw, choice in SMS_KEYWORDS.items():
@@ -607,35 +732,32 @@ def sms_inbound():
     candidate_nm = " ".join(parts[1:]).title()
     src, amt, conf = SIGHTINGS.get(sighting_key, ("citizen_report", 500_000, 0.60))
 
-    cid   = upsert_candidate(candidate_nm, constituency)
+    cid       = upsert_candidate(candidate_nm, constituency)
     insert_expenditure(
         cid, src, amt, conf,
         f"SMS sighting from {phone}: {src}", constituency
     )
-    count = count_constituency_reports(constituency)
+    count     = count_constituency_reports(constituency)
+    report_id = format_report_id(cid)  # FIX: UUID-safe
     reward_airtime(phone, 5.0)
-    
-    # ✅ FIXED:
-    report_id = f"{cid:06d}"
-    
+
     send_sms([phone],
-        f"✅ Mizani: Logged #{report_id}!\\n"
-        f"{candidate_nm}, {constituency} — {src}\\n"
-        f"{count} reports from this constituency.\\n"
+        f"✅ Mizani: Logged #{report_id}!\n"
+        f"{candidate_nm}, {constituency} — {src}\n"
+        f"{count} reports from this constituency.\n"
         f"You earned KES 5 airtime. Asante!"
     )
     return "OK", 200
 
 
 def _handle_journalist_reply(phone: str, message: str):
-    """Reply to a journalist's MOREINFO request with evidence breakdown."""
     parts     = message.replace("MOREINFO", "").strip().split()
     cand_name = " ".join(parts).lower() if parts else ""
     if not cand_name:
         send_sms([phone], "❌ Usage: MOREINFO CANDIDATE NAME")
         return "OK", 200
 
-    r = (supabase.table("candidates").select("*")
+    r = (supabase().table("candidates").select("*")
          .ilike("candidate_name", f"%{cand_name}%")
          .limit(1).execute())
     if not r.data:
@@ -643,7 +765,7 @@ def _handle_journalist_reply(phone: str, message: str):
         return "OK", 200
 
     c    = r.data[0]
-    exps = (supabase.table("expenditures")
+    exps = (supabase().table("expenditures")
             .select("source_type,amount,confidence_score,created_at")
             .eq("candidate_id", c["candidate_id"])
             .order("created_at", desc=True)
@@ -664,10 +786,6 @@ def _handle_journalist_reply(phone: str, message: str):
 
 @app.route("/api/voice/brief", methods=["POST"])
 def voice_brief():
-    """
-    Trigger an automated voice call briefing to an IEBC officer.
-    POST body: { "phone": "+254...", "candidate_name": "...", "spr": 2.1 }
-    """
     data  = request.json or {}
     phone = data.get("phone")
     cname = data.get("candidate_name", "Unknown")
@@ -675,10 +793,9 @@ def voice_brief():
     if not phone:
         return jsonify({"error": "phone required"}), 400
 
-    # AT Voice call — server plays TTS via SSML-like XML
     call_from = os.environ.get("AT_VOICE_NUMBER", "")
     if DEMO_MODE:
-        print(f"[DEMO VOICE] Calling {phone} re: {cname} SPR={spr:.2f}")
+        logger.info(f"[DEMO VOICE] Calling {phone} re: {cname} SPR={spr:.2f}")
         return jsonify({"demo": True, "phone": phone})
     try:
         resp = at("voice").call(call_from=call_from, call_to=phone)
@@ -689,7 +806,6 @@ def voice_brief():
 
 @app.route("/api/voice/callback", methods=["POST"])
 def voice_callback():
-    """AT calls this URL when the recipient picks up. Return SSML."""
     cname = request.values.get("candidate_name", "a candidate")
     spr   = request.values.get("spr", "unknown")
     xml = (
@@ -706,14 +822,6 @@ def voice_callback():
     return Response(xml, content_type="application/xml")
 
 
-# ── SIM-swap check ────────────────────────────────────────────────────────────
-
-def _sim_swap_check(phone: str) -> dict:
-    if DEMO_MODE:
-        return {"swapped": False, "confidence": 0.95}
-    # TODO: wire up AT SIM Swap Detection API
-    return {"swapped": False, "confidence": 0.80}
-
 @app.route("/api/sim-swap/<phone>", methods=["GET"])
 def check_sim_swap(phone):
     return jsonify(_sim_swap_check(phone))
@@ -723,14 +831,25 @@ def check_sim_swap(phone):
 
 @app.route("/health")
 def health():
-    count = supabase.table("candidates").select("count", count="exact").execute()
+    try:
+        count = supabase().table("candidates").select("count", count="exact").execute()
+        candidates_loaded = count.count
+        db_status = "ok"
+    except Exception as e:
+        candidates_loaded = -1
+        db_status = str(e)
+
     return jsonify({
         "status":            "Mizani LIVE",
-        "candidates_loaded": count.count,
+        "candidates_loaded": candidates_loaded,
+        "db_status":         db_status,
         "demo_mode":         DEMO_MODE,
         "alert_recipients":  len(ALERT_RECIPIENTS),
-        "at_username":       os.environ.get("AFRICAS_TALKING_USERNAME", "sandbox"),
+        "at_username":       os.environ.get("AT_USERNAME", "sandbox"),
+        "pdf_bucket":        PDF_BUCKET,
     })
 
 
-# app.run(debug=True, host="0.0.0.0", port=5000)
+# ── Entry point (development only — use gunicorn in production) ───────────────
+# if __name__ == "__main__":
+#     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
