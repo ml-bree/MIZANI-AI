@@ -394,35 +394,35 @@ def set_session_lang(session_id: str, lang: str):
 
 # ── SIM-swap check ────────────────────────────────────────────────────────────
 
-def _sim_swap_check(phone: str) -> dict:
-    """
-    FIX: Previously returned a hardcoded dict in production.
-    Now calls the AT SIM Swap Detection API when DEMO_MODE=false.
-    Requires AT_SIM_SWAP_URL to be set (from AT dashboard).
-    """
-    if DEMO_MODE:
-        return {"swapped": False, "confidence": 0.95}
-    try:
-        import requests as req
-        url = os.environ.get(
-            "AT_SIM_SWAP_URL",
-            "https://api.africastalking.com/sim-swap/check"
-        )
-        headers = {
-            "apiKey":  os.environ.get("AT_API_KEY", ""),
-            "Accept":  "application/json",
-        }
-        resp = req.post(url, json={"phoneNumber": phone}, headers=headers, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "swapped":    data.get("swapped", False),
-            "confidence": data.get("confidence", 0.80),
-        }
-    except Exception as e:
-        logger.error(f"SIM swap check error: {e}")
-        # Fail open — don't block legitimate users if the API is down
-        return {"swapped": False, "confidence": 0.50}
+# def _sim_swap_check(phone: str) -> dict:
+#     """
+#     FIX: Previously returned a hardcoded dict in production.
+#     Now calls the AT SIM Swap Detection API when DEMO_MODE=false.
+#     Requires AT_SIM_SWAP_URL to be set (from AT dashboard).
+#     """
+#     if DEMO_MODE:
+#         return {"swapped": False, "confidence": 0.95}
+#     try:
+#         import requests as req
+#         url = os.environ.get(
+#             "AT_SIM_SWAP_URL",
+#             "https://api.africastalking.com/sim-swap/check"
+#         )
+#         headers = {
+#             "apiKey":  os.environ.get("AT_API_KEY", ""),
+#             "Accept":  "application/json",
+#         }
+#         resp = req.post(url, json={"phoneNumber": phone}, headers=headers, timeout=5)
+#         resp.raise_for_status()
+#         data = resp.json()
+#         return {
+#             "swapped":    data.get("swapped", False),
+#             "confidence": data.get("confidence", 0.80),
+#         }
+#     except Exception as e:
+#         logger.error(f"SIM swap check error: {e}")
+#         # Fail open — don't block legitimate users if the API is down
+#         return {"swapped": False, "confidence": 0.50}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
