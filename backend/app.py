@@ -529,11 +529,20 @@ def analyze_candidate():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ussd_response(msg: str) -> Response:
-    """Return USSD response with EXACT format AT expects."""
-    logger.info(f"📱 USSD Response: {repr(msg[:80])}...")
-    response = Response(msg, mimetype="text/plain")
-    response.headers["Content-Type"] = "text/plain; charset=utf-8"
-    return response
+    """Bulletproof USSD response for Africa's Talking."""
+    # Strip ALL whitespace
+    msg = msg.strip()
+    
+    # Log exactly what we're sending
+    logger.info(f"📱 Sending USSD: {repr(msg[:50])}")
+    logger.info(f"📱 Message length: {len(msg)} chars, {len(msg.encode('utf-8'))} bytes")
+    
+    # Return SIMPLEST possible response
+    return Response(
+        msg,
+        status=200,
+        content_type="text/plain"
+    )
 
 
 def _sim_swap_check(phone: str) -> dict:
