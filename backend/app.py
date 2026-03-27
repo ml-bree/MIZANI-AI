@@ -526,6 +526,26 @@ def analyze_candidate():
 
 # ── USSD (bilingual EN/SW) ────────────────────────────────────────────────────
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _ussd_response(msg: str) -> Response:
+    """Return USSD response with EXACT format AT expects."""
+    logger.info(f"📱 USSD Response: {repr(msg[:80])}...")
+    response = Response(msg, mimetype="text/plain")
+    response.headers["Content-Type"] = "text/plain; charset=utf-8"
+    return response
+
+
+def _sim_swap_check(phone: str) -> dict:
+    """SIM swap check - safe fallback for hackathon demo."""
+    if DEMO_MODE:
+        return {"swapped": False, "confidence": 0.95}
+    logger.info(f"SIM-swap check skipped for {phone}")
+    return {"swapped": False, "confidence": 0.80}
+
+
+# ── USSD Menus (Bilingual EN/SW) ──────────────────────────────────────────────
+
 USSD_MENUS = {
     "en": {
         "welcome": (
@@ -535,8 +555,8 @@ USSD_MENUS = {
             "2. Check a candidate\n"
             "0. Switch to Kiswahili"
         ),
-        "ask_const":     "CON Enter constituency name:",
-        "ask_cand":      "CON Enter candidate full name:",
+        "ask_const": "CON Enter constituency name:",
+        "ask_cand": "CON Enter candidate full name:",
         "ask_sight": (
             "CON What did you observe?\n"
             "1. Billboard / signage\n"
@@ -545,7 +565,7 @@ USSD_MENUS = {
             "4. Cash or gifts distributed"
         ),
         "ask_cand_check": "CON Enter candidate name to check SPR:",
-        "invalid":  "END ❌ Invalid input. Please dial *384# again.",
+        "invalid": "END ❌ Invalid input. Please dial *384# again.",
         "security": "END ⚠️ Security check failed. Session ended.",
     },
     "sw": {
@@ -556,8 +576,8 @@ USSD_MENUS = {
             "2. Angalia mgombea\n"
             "0. Switch to English"
         ),
-        "ask_const":     "CON Ingiza jina la jimbo:",
-        "ask_cand":      "CON Ingiza jina kamili la mgombea:",
+        "ask_const": "CON Ingiza jina la jimbo:",
+        "ask_cand": "CON Ingiza jina kamili la mgombea:",
         "ask_sight": (
             "CON Uliona nini?\n"
             "1. Bango au tangazo\n"
@@ -566,48 +586,43 @@ USSD_MENUS = {
             "4. Pesa au zawadi zilizosambazwa"
         ),
         "ask_cand_check": "CON Ingiza jina la mgombea kukagua SPR:",
-        "invalid":  "END ❌ Ingizo batili. Piga simu *384# tena.",
+        "invalid": "END ❌ Ingizo batili. Piga simu *384# tena.",
         "security": "END ⚠️ Ukaguzi wa usalama umeshindwa. Kikao kimeisha.",
     },
 }
 
-def _sim_swap_check(phone: str) -> dict:
-    """SIM swap check - safe fallback for hackathon demo."""
-    if DEMO_MODE:
-        return {"swapped": False, "confidence": 0.95}
-    # Production: AT SIM Swap API (disabled for now)
-    logger.info(f"SIM-swap check skipped for {phone}")
-    return {"swapped": False, "confidence": 0.80}
-    
+
+# ── USSD Callback (Production-Ready) ──────────────────────────────────────────
+
 @app.route("/api/ussd/callback", methods=["POST"])
 def ussd_callback():
     session_id = request.values.get("sessionId", "")
-    phone      = request.values.get("phoneNumber", "").strip()
-    text       = request.values.get("text", "").strip()
-    steps      = [s.strip() for s in text.split("*")] if text else []
+    phone = request.values.get("phoneNumber", "").strip()
+    text = request.values.get("text", "").strip()
+    steps = [s.strip() for s in text.split("*")] if text else []
 
-    # Language resolution (Supabase-backed — safe across multiple instances)
+    # Language resolution (Supabase-backed)
     lang = get_session_lang(session_id)
-    M    = USSD_MENUS[lang]
+    M = USSD_MENUS[lang]
 
-    # # SIM-swap guard
-    # if not DEMO_MODE:
-    #     swap = _sim_swap_check(phone)
-    #     if swap.get("swapped"):
-    #         return _ussd_response(M["security"])
+    # SIM-swap guard (disabled for demo)
+    if not DEMO_MODE:
+        swap = _sim_swap_check(phone)
+        if swap.get("swapped"):
+            return _ussd_response(M["security"])
 
-    # ── Level 0 : welcome ──────────────────────────────────────────────────
+    # ── Level 0: Welcome (no text = first dial) ──────────────────────────────
     if not text:
         set_session_lang(session_id, "en")
         return _ussd_response(USSD_MENUS["en"]["welcome"])
 
-    # ── Language toggle ────────────────────────────────────────────────────
+    # ── Language Toggle (0) ──────────────────────────────────────────────────
     if len(steps) == 1 and steps[0] == "0":
         new_lang = "sw" if lang == "en" else "en"
         set_session_lang(session_id, new_lang)
         return _ussd_response(USSD_MENUS[new_lang]["welcome"])
 
-    # ── Branch: Report (1) vs Check (2) ───────────────────────────────────
+    # ── Branch: Report (1) vs Check (2) ──────────────────────────────────────
     if len(steps) == 1:
         if steps[0] == "1":
             return _ussd_response(M["ask_const"])
@@ -615,26 +630,32 @@ def ussd_callback():
             return _ussd_response(M["ask_cand_check"])
         return _ussd_response(M["invalid"])
 
-    # ── BRANCH 1: Report flow ─────────────────────────────────────────────
+    # ── BRANCH 1: Report Flow ────────────────────────────────────────────────
     if steps[0] == "1":
         if len(steps) == 2:
             return _ussd_response(M["ask_cand"])
+        
         if len(steps) == 3:
             return _ussd_response(M["ask_sight"])
+        
         if len(steps) == 4:
             constituency = steps[1].title()
             candidate_nm = steps[2].title()
-            choice       = steps[3]
+            choice = steps[3]
+            
             if choice not in SIGHTINGS:
                 return _ussd_response(M["invalid"])
+            
             src, amt, conf = SIGHTINGS[choice]
             cid = upsert_candidate(candidate_nm, constituency)
+            
             insert_expenditure(
                 cid, src, amt, conf,
                 f"USSD sighting by {phone}: {src}", constituency
             )
-            count     = count_constituency_reports(constituency)
-            report_id = format_report_id(cid)  # FIX: UUID-safe
+            
+            count = count_constituency_reports(constituency)
+            report_id = format_report_id(cid)
             reward_airtime(phone, 5.0)
 
             if lang == "sw":
@@ -655,30 +676,34 @@ def ussd_callback():
                 )
             return _ussd_response(msg)
 
-    # ── BRANCH 2: Check flow ──────────────────────────────────────────────
+    # ── BRANCH 2: Check Flow ─────────────────────────────────────────────────
     if steps[0] == "2":
         if len(steps) == 2:
             name = steps[1].lower()
             r = (supabase().table("candidates").select("*")
                  .ilike("candidate_name", f"%{name}%")
                  .limit(1).execute())
+            
             if not r.data:
                 return _ussd_response(
                     "END ❌ Candidate not found. Try the full name."
                     if lang == "en"
                     else "END ❌ Mgombea hajapatikana. Jaribu jina kamili."
                 )
-            c   = r.data[0]
+            
+            c = r.data[0]
             dec = float(c.get("declared_assets") or 0)
+            
             exr = (supabase().table("expenditures")
                    .select("amount")
                    .eq("candidate_id", c["candidate_id"])
                    .execute())
+            
             db_sp = sum(float(e.get("amount") or 0) for e in exr.data)
             total = db_sp + fetch_meta_ads(c["candidate_name"])
-            ceil  = dec * 1.3
-            spr   = round(total / ceil, 2) if ceil > 0 else 0
-            lvl   = alert_level(spr)
+            ceil = dec * 1.3
+            spr = round(total / ceil, 2) if ceil > 0 else 0
+            lvl = alert_level(spr)
 
             if lang == "sw":
                 msg = (
@@ -700,138 +725,8 @@ def ussd_callback():
                 )
             return _ussd_response(msg)
 
+    # ── Fallback: Invalid Input ──────────────────────────────────────────────
     return _ussd_response(M["invalid"])
-
-
-# ── Inbound SMS ───────────────────────────────────────────────────────────────
-
-@app.route("/api/sms/inbound", methods=["POST"])
-def sms_inbound():
-    """
-    Format: CONSTITUENCY CANDIDATE_NAME KEYWORD
-    e.g.  : STAREHE JOHN DOE CONVOY
-    Swahili: STAREHE JOHN DOE GARI
-    """
-    phone   = request.values.get("from", "").strip()
-    message = request.values.get("text", "").strip().upper()
-
-    if message.startswith("MOREINFO"):
-        return _handle_journalist_reply(phone, message)
-
-    sighting_key = None
-    clean        = message
-    for kw, choice in SMS_KEYWORDS.items():
-        if kw in message:
-            sighting_key = choice
-            clean = message.replace(kw, "").strip()
-            break
-
-    parts = clean.split()
-    if len(parts) < 2:
-        send_sms([phone],
-            "❌ Mizani: Format: CONSTITUENCY NAME SIGHTING\n"
-            "e.g. STAREHE JOHN DOE CONVOY\n"
-            "Dial *384# for a guided session."
-        )
-        return "OK", 200
-
-    constituency = parts[0].title()
-    candidate_nm = " ".join(parts[1:]).title()
-    src, amt, conf = SIGHTINGS.get(sighting_key, ("citizen_report", 500_000, 0.60))
-
-    cid       = upsert_candidate(candidate_nm, constituency)
-    insert_expenditure(
-        cid, src, amt, conf,
-        f"SMS sighting from {phone}: {src}", constituency
-    )
-    count     = count_constituency_reports(constituency)
-    report_id = format_report_id(cid)  # FIX: UUID-safe
-    reward_airtime(phone, 5.0)
-
-    send_sms([phone],
-        f"✅ Mizani: Logged #{report_id}!\n"
-        f"{candidate_nm}, {constituency} — {src}\n"
-        f"{count} reports from this constituency.\n"
-        f"You earned KES 5 airtime. Asante!"
-    )
-    return "OK", 200
-
-
-def _handle_journalist_reply(phone: str, message: str):
-    parts     = message.replace("MOREINFO", "").strip().split()
-    cand_name = " ".join(parts).lower() if parts else ""
-    if not cand_name:
-        send_sms([phone], "❌ Usage: MOREINFO CANDIDATE NAME")
-        return "OK", 200
-
-    r = (supabase().table("candidates").select("*")
-         .ilike("candidate_name", f"%{cand_name}%")
-         .limit(1).execute())
-    if not r.data:
-        send_sms([phone], f"❌ No IEBC record found for '{cand_name}'.")
-        return "OK", 200
-
-    c    = r.data[0]
-    exps = (supabase().table("expenditures")
-            .select("source_type,amount,confidence_score,created_at")
-            .eq("candidate_id", c["candidate_id"])
-            .order("created_at", desc=True)
-            .limit(5).execute())
-
-    lines = [f"📋 Mizani evidence: {c['candidate_name']}"]
-    for e in exps.data:
-        lines.append(
-            f"• {e['source_type']}: KES {float(e['amount']):,.0f} "
-            f"({float(e['confidence_score'])*100:.0f}% conf)"
-        )
-    lines.append(f"Full PDF: mizani.ke/r/{safe_fn(c['candidate_name'])}")
-    send_sms([phone], "\n".join(lines))
-    return "OK", 200
-
-
-# ── Outbound voice briefing (AT Voice) ───────────────────────────────────────
-
-@app.route("/api/voice/brief", methods=["POST"])
-def voice_brief():
-    data  = request.json or {}
-    phone = data.get("phone")
-    cname = data.get("candidate_name", "Unknown")
-    spr   = float(data.get("spr", 0))
-    if not phone:
-        return jsonify({"error": "phone required"}), 400
-
-    call_from = os.environ.get("AT_VOICE_NUMBER", "")
-    if DEMO_MODE:
-        logger.info(f"[DEMO VOICE] Calling {phone} re: {cname} SPR={spr:.2f}")
-        return jsonify({"demo": True, "phone": phone})
-    try:
-        resp = at("voice").call(call_from=call_from, call_to=phone)
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/voice/callback", methods=["POST"])
-def voice_callback():
-    cname = request.values.get("candidate_name", "a candidate")
-    spr   = request.values.get("spr", "unknown")
-    xml = (
-        '<?xml version="1.0"?>'
-        '<Response>'
-        '<Say voice="en-US-Standard-D" playBeep="true">'
-        f'This is an automated alert from Mizani AI. '
-        f'Candidate {cname} has a Spend Promise Ratio of {spr}. '
-        f'This exceeds the declared wealth threshold and requires investigation. '
-        f'Please visit mizani dot ke for the full report.'
-        '</Say>'
-        '</Response>'
-    )
-    return Response(xml, content_type="application/xml")
-
-
-@app.route("/api/sim-swap/<phone>", methods=["GET"])
-def check_sim_swap(phone):
-    return jsonify(_sim_swap_check(phone))
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
